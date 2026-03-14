@@ -1,0 +1,47 @@
+[package]
+name = "corduroy"
+version = "0.1.0"
+edition = "2021"
+description = "Adaptive mesh precipitation mapping from ERA5 Zarr v3"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Zarr v3 reading
+zarrs = { version = "0.23", features = ["ndarray", "async"] }
+zarrs_object_store = "0.6"
+
+# Cloud object storage
+object_store = { version = "0.13", features = ["gcp"] }
+
+# N-dimensional arrays
+ndarray = "0.17"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Image output
+image = "0.25"
+colorgrad = "0.7"
+
+# DateTime
+chrono = "0.4"
+
+# Python bindings (optional, activated by maturin)
+pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
+numpy = { version = "0.28", optional = true }
+
+[features]
+default = []
+python = ["pyo3", "numpy"]

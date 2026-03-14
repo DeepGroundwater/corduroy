@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "corduroy"
+version = "0.1.0"
+description = "Adaptive mesh precipitation mapping from ERA5 Zarr v3"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.21"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+notebook = ["jupyter", "matplotlib"]
+
+[tool.maturin]
+features = ["python"]
+module-name = "corduroy"
+
+[dependency-groups]
+dev = [
+    "pytest>=7",
+    "jupyter",
+    "matplotlib",
+    "patchelf",
+]
+forecast = [
+    "neuralgcm",
+    "dinosaur",
+    "gcsfs",
+    "xarray",
+    "jax[cuda12]",
+]
