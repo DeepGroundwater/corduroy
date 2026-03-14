@@ -1,4 +1,8 @@
-use ndarray::Array2;
+use std::collections::{HashMap, VecDeque};
+
+use ndarray::{s, Array2, Array3, Array4, ArrayBase, Data, Ix2};
+
+use crate::data::{Era5Array, Era5Dataset};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegridError {
@@ -172,6 +176,8 @@ pub struct ConservativeRegridder {
     n_src_lon: usize,
     n_tgt_lat: usize,
     n_tgt_lon: usize,
+    tgt_lats: Vec<f64>,
+    tgt_lons: Vec<f64>,
 }
 
 impl ConservativeRegridder {
@@ -239,6 +245,8 @@ impl ConservativeRegridder {
             n_src_lon: src_lons.len(),
             n_tgt_lat: tgt_lats.len(),
             n_tgt_lon: tgt_lons.len(),
+            tgt_lats: tgt_lats.to_vec(),
+            tgt_lons: tgt_lons.to_vec(),
         })
     }
 
@@ -249,10 +257,15 @@ impl ConservativeRegridder {
 
     /// Regrid a 2D field (lat × lon) using precomputed weights.
     ///
+    /// Accepts both owned arrays (`&Array2<f32>`) and views (`ArrayView2<f32>`).
+    ///
     /// NaN values in the source are handled by mask-based renormalization:
     /// a validity mask is regridded alongside the data, then used to
     /// normalize the output. Fully-NaN target cells remain NaN.
-    pub fn regrid(&self, data: &Array2<f32>) -> Result<Array2<f32>, RegridError> {
+    pub fn regrid<S: Data<Elem = f32>>(
+        &self,
+        data: &ArrayBase<S, Ix2>,
+    ) -> Result<Array2<f32>, RegridError> {
         let (n_lat, n_lon) = data.dim();
         if n_lat != self.n_src_lat || n_lon != self.n_src_lon {
             return Err(RegridError::ShapeMismatch {
@@ -290,6 +303,116 @@ impl ConservativeRegridder {
         }
 
         Ok(result)
+    }
+
+    /// Regrid an entire `Era5Dataset`, applying the 2D regrid to every
+    /// (time, level) slice for pressure-level variables and every (time)
+    /// slice for surface variables. NaN values are flood-filled with the
+    /// nearest valid neighbor after regridding (matching dinosaur behavior).
+    ///
+    /// Returns a new `Era5Dataset` with target grid coordinates.
+    pub fn regrid_dataset(&self, dataset: &Era5Dataset) -> Result<Era5Dataset, RegridError> {
+        let mut regridded_vars = HashMap::new();
+
+        for (name, array) in &dataset.variables {
+            tracing::info!("regridding {}", name);
+            let regridded = match array {
+                Era5Array::PressureLevel(arr) => {
+                    let (n_time, n_level, _, _) = arr.dim();
+                    let mut out = Array4::<f32>::from_elem(
+                        (n_time, n_level, self.n_tgt_lat, self.n_tgt_lon),
+                        f32::NAN,
+                    );
+                    for t in 0..n_time {
+                        for l in 0..n_level {
+                            let slice = arr.slice(s![t, l, .., ..]);
+                            let regridded_slice = self.regrid(&slice)?;
+                            out.slice_mut(s![t, l, .., ..]).assign(&regridded_slice);
+                        }
+                    }
+                    // Fill NaN with nearest valid neighbor per 2D slice
+                    for t in 0..n_time {
+                        for l in 0..n_level {
+                            let mut slice = out.slice_mut(s![t, l, .., ..]);
+                            fill_nan_nearest(&mut slice);
+                        }
+                    }
+                    Era5Array::PressureLevel(out)
+                }
+                Era5Array::Surface(arr) => {
+                    let (n_time, _, _) = arr.dim();
+                    let mut out = Array3::<f32>::from_elem(
+                        (n_time, self.n_tgt_lat, self.n_tgt_lon),
+                        f32::NAN,
+                    );
+                    for t in 0..n_time {
+                        let slice = arr.slice(s![t, .., ..]);
+                        let regridded_slice = self.regrid(&slice)?;
+                        out.slice_mut(s![t, .., ..]).assign(&regridded_slice);
+                    }
+                    for t in 0..n_time {
+                        let mut slice = out.slice_mut(s![t, .., ..]);
+                        fill_nan_nearest(&mut slice);
+                    }
+                    Era5Array::Surface(out)
+                }
+            };
+            regridded_vars.insert(name.clone(), regridded);
+        }
+
+        Ok(Era5Dataset {
+            variables: regridded_vars,
+            times: dataset.times.clone(),
+            latitudes: self.tgt_lats.clone(),
+            longitudes: self.tgt_lons.clone(),
+            levels: dataset.levels.clone(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NaN flood fill (nearest neighbor, BFS)
+// ---------------------------------------------------------------------------
+
+/// Fill NaN values in a 2D array with the nearest non-NaN value using BFS.
+/// Longitude (columns) wraps around for global grids.
+/// Operates in-place on a mutable 2D view.
+fn fill_nan_nearest(data: &mut ndarray::ArrayViewMut2<'_, f32>) {
+    let (n_rows, n_cols) = data.dim();
+    let mut queue = VecDeque::new();
+
+    // Seed queue with non-NaN cells adjacent to at least one NaN cell
+    for r in 0..n_rows {
+        for c in 0..n_cols {
+            if !data[[r, c]].is_nan() {
+                let neighbors: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+                for (dr, dc) in neighbors {
+                    let nr = r as i32 + dr;
+                    let nc = (c as i32 + dc).rem_euclid(n_cols as i32);
+                    if nr >= 0 && nr < n_rows as i32 && data[[nr as usize, nc as usize]].is_nan() {
+                        queue.push_back((r, c));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // BFS: spread values outward from valid cells
+    while let Some((r, c)) = queue.pop_front() {
+        let val = data[[r, c]];
+        let neighbors: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+        for (dr, dc) in neighbors {
+            let nr = r as i32 + dr;
+            let nc = (c as i32 + dc).rem_euclid(n_cols as i32);
+            if nr >= 0 && nr < n_rows as i32 {
+                let (nr, nc) = (nr as usize, nc as usize);
+                if data[[nr, nc]].is_nan() {
+                    data[[nr, nc]] = val;
+                    queue.push_back((nr, nc));
+                }
+            }
+        }
     }
 }
 

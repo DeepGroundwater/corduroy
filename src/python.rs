@@ -169,6 +169,14 @@ impl PyConservativeRegridder {
         Ok(numpy::ToPyArray::to_pyarray(&result, py))
     }
 
+    /// Regrid an entire Era5Dataset (all variables × timesteps × levels).
+    /// NaN values are flood-filled with the nearest valid neighbor.
+    /// Returns a new Era5Dataset on the target grid.
+    fn regrid_dataset(&self, dataset: &PyEra5Dataset) -> PyResult<PyEra5Dataset> {
+        let result = self.inner.regrid_dataset(&dataset.inner).map_err(to_pyerr)?;
+        Ok(PyEra5Dataset { inner: result })
+    }
+
     fn __repr__(&self) -> String {
         let (tgt_lat, tgt_lon) = self.inner.target_shape();
         format!(

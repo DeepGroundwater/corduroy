@@ -413,3 +413,75 @@ class TestFetchEra5GlobalNetwork:
         assert len(ds.levels) == 37
         assert ds.dims("sea_ice_cover") == ["time", "latitude", "longitude"]
         assert "Era5Dataset" in repr(ds)
+
+
+# -- regrid_dataset (offline) ------------------------------------------------
+
+
+class TestRegridDataset:
+    def _make_mock_dataset(self):
+        """Build a minimal Era5Dataset-like object using the regridder's identity case."""
+        import corduroy
+
+        # 4x4 grid, 1 timestep
+        lats = np.linspace(45.0, 42.0, 4)
+        lons = np.linspace(0.0, 3.0, 4)
+        # Need a real Era5Dataset — build one by fetching? No, construct manually.
+        # We can't construct Era5Dataset from Python, so we test via the regridder
+        # on synthetic arrays. Use fetch_era5_global in network tests instead.
+        return lats, lons
+
+    def test_regrid_dataset_identity(self):
+        """regrid_dataset on a fetched dataset with identity grid preserves values."""
+        # This test requires network. Mark it appropriately.
+        pytest.importorskip("gcsfs", reason="gcsfs required")
+        import corduroy
+
+        ds = corduroy.fetch_era5_global(
+            variables=["sea_ice_cover"],
+            time_start="2023-06-15T00:00:00",
+            time_end="2023-06-15T00:00:00",
+            time_step_hours=1,
+        )
+
+        # Identity regrid: same source and target grid
+        rg = corduroy.ConservativeRegridder(
+            ds.latitudes, ds.longitudes, ds.latitudes, ds.longitudes
+        )
+        result = rg.regrid_dataset(ds)
+
+        assert result.variable_names == ds.variable_names
+        assert len(result.latitudes) == len(ds.latitudes)
+        assert len(result.longitudes) == len(ds.longitudes)
+        src = ds.get("sea_ice_cover")
+        dst = result.get("sea_ice_cover")
+        assert src.shape == dst.shape
+        # Values should be close (identity regrid)
+        valid = ~np.isnan(src) & ~np.isnan(dst)
+        np.testing.assert_allclose(dst[valid], src[valid], atol=1e-2)
+
+    def test_regrid_dataset_coarsening(self):
+        """regrid_dataset coarsens a fetched dataset to a smaller grid."""
+        pytest.importorskip("gcsfs", reason="gcsfs required")
+        import corduroy
+
+        ds = corduroy.fetch_era5_global(
+            variables=["sea_ice_cover"],
+            time_start="2023-06-15T00:00:00",
+            time_end="2023-06-15T00:00:00",
+            time_step_hours=1,
+        )
+
+        # Coarsen to ~1 degree (181 lat x 360 lon)
+        tgt_lats = np.linspace(90.0, -90.0, 181)
+        tgt_lons = np.linspace(0.0, 359.0, 360)
+
+        rg = corduroy.ConservativeRegridder(
+            ds.latitudes, ds.longitudes, tgt_lats, tgt_lons
+        )
+        result = rg.regrid_dataset(ds)
+
+        arr = result.get("sea_ice_cover")
+        assert arr.shape == (1, 181, 360)
+        assert len(result.latitudes) == 181
+        assert len(result.longitudes) == 360
