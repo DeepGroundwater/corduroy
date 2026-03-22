@@ -11,7 +11,7 @@ dependencies = ["numpy>=1.21"]
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
-notebook = ["jupyter", "matplotlib"]
+notebook = ["jupyter", "matplotlib", "py3dep"]
 
 [tool.maturin]
 features = ["python"]
@@ -23,6 +23,7 @@ dev = [
     "jupyter",
     "matplotlib",
     "patchelf",
+    "py3dep",
 ]
 forecast = [
     "neuralgcm",

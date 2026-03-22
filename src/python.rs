@@ -2,13 +2,15 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use ndarray::Array2;
-use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use ndarray::Array3;
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::domain::{self, BoundingBox, PrecipitationField};
+use crate::hydro::grid::{ChannelNetwork, DemGrid, RasterDomain, SoilGrid};
 use crate::regrid::ConservativeRegridder;
-use crate::{data, plot};
+use crate::{data, hydro, plot};
 
 // ---------------------------------------------------------------------------
 // Tokio runtime singleton
@@ -478,6 +480,103 @@ fn fetch_era5_global(
 }
 
 // ---------------------------------------------------------------------------
+// Watershed runner binding
+// ---------------------------------------------------------------------------
+
+/// Run the CASC2D hydrologic model (Green-Ampt infiltration + 2D diffusive-wave
+/// overland flow + 1D channel routing) on a raster watershed.
+///
+/// Parameters
+/// ----------
+/// dem_elev : ndarray (nrows, ncols) float64
+///     Ground surface elevation in metres.
+/// k_sat : ndarray (nrows, ncols) float64
+///     Saturated hydraulic conductivity K (m/s).
+/// h_cap : ndarray (nrows, ncols) float64
+///     Capillary suction head at wetting front Hf (m).
+/// m_def : ndarray (nrows, ncols) float64
+///     Initial moisture deficit Md = θe − θi (dimensionless, 0–1).
+/// mann_n : ndarray (nrows, ncols) float64
+///     Manning roughness coefficient n for overland flow.
+/// retention : ndarray (nrows, ncols) float64
+///     Surface retention storage depth (m).
+/// rainfall : ndarray (n_steps, nrows, ncols) float64
+///     Gross rainfall rate (m/s) at each timestep.
+/// cell_size : float
+///     Uniform raster cell width W (m).
+/// dt : float
+///     Model timestep (s). Must satisfy the CFL condition; use `max_stable_dt`
+///     or keep dt ≤ W / (2 × V_max) where V_max is the peak expected flow speed.
+/// output_interval : int
+///     Save state snapshots every N timesteps (default 1 = every step).
+///
+/// Returns
+/// -------
+/// dict with keys:
+///   'time'        – list[float]       simulation time (s) at each snapshot
+///   'q_outlet'    – list[float]       outlet discharge (m³/s)
+///   'h_snapshots' – list[ndarray]     overland water depth (m), shape (nrows, ncols)
+///   'f_snapshots' – list[ndarray]     cumulative infiltration depth (m), shape (nrows, ncols)
+#[pyfunction]
+#[pyo3(signature = (dem_elev, k_sat, h_cap, m_def, mann_n, retention, rainfall,
+                    cell_size, dt, output_interval=1))]
+#[allow(clippy::too_many_arguments)]
+fn run_watershed<'py>(
+    py: Python<'py>,
+    dem_elev: PyReadonlyArray2<'_, f64>,
+    k_sat: PyReadonlyArray2<'_, f64>,
+    h_cap: PyReadonlyArray2<'_, f64>,
+    m_def: PyReadonlyArray2<'_, f64>,
+    mann_n: PyReadonlyArray2<'_, f64>,
+    retention: PyReadonlyArray2<'_, f64>,
+    rainfall: PyReadonlyArray3<'_, f64>,
+    cell_size: f64,
+    dt: f64,
+    output_interval: usize,
+) -> PyResult<pyo3::Bound<'py, pyo3::types::PyDict>> {
+    let dem_arr = dem_elev.as_array().to_owned();
+    let shape = dem_arr.shape();
+    let (nrows, ncols) = (shape[0], shape[1]);
+
+    let domain = RasterDomain::new(nrows, ncols, cell_size).map_err(to_pyerr)?;
+    let dem = DemGrid::new(domain.clone(), dem_arr).map_err(to_pyerr)?;
+    let soil = SoilGrid::new(
+        domain,
+        k_sat.as_array().to_owned(),
+        h_cap.as_array().to_owned(),
+        m_def.as_array().to_owned(),
+        mann_n.as_array().to_owned(),
+        retention.as_array().to_owned(),
+    )
+    .map_err(to_pyerr)?;
+
+    let channel = ChannelNetwork::empty(nrows, ncols);
+    let params = hydro::runner::HydroParams::new(dem, soil, channel);
+
+    let rain_arr: Array3<f64> = rainfall.as_array().to_owned();
+    let output_iv = if output_interval == 0 { 1 } else { output_interval };
+    let output = hydro::runner::run(&params, &rain_arr, dt, output_iv).map_err(to_pyerr)?;
+
+    let result = pyo3::types::PyDict::new(py);
+    result.set_item("time", pyo3::types::PyList::new(py, &output.time)?)?;
+    result.set_item("q_outlet", pyo3::types::PyList::new(py, &output.q_outlet)?)?;
+
+    let h_list = pyo3::types::PyList::empty(py);
+    for h in &output.h_snapshots {
+        h_list.append(numpy::ToPyArray::to_pyarray(h, py))?;
+    }
+    result.set_item("h_snapshots", h_list)?;
+
+    let f_list = pyo3::types::PyList::empty(py);
+    for f in &output.f_snapshots {
+        f_list.append(numpy::ToPyArray::to_pyarray(f, py))?;
+    }
+    result.set_item("f_snapshots", f_list)?;
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -494,5 +593,6 @@ fn corduroy_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(render_heatmap_to_file, m)?)?;
     m.add_function(wrap_pyfunction!(datetime_to_time_index, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_era5_global, m)?)?;
+    m.add_function(wrap_pyfunction!(run_watershed, m)?)?;
     Ok(())
 }
